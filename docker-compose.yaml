@@ -1,0 +1,30 @@
+services:
+  main:
+    build:
+      context: .
+      dockerfile: main/Dockerfile
+    ports:
+      - "${APP_PORT:-8080}:80"
+    environment:
+      SECONDARY_REPLICAS_COUNT: ${SECONDARY_REPLICAS_COUNT:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  secondary:
+    build:
+      context: .
+      dockerfile: secondary/Dockerfile
+    environment:
+      MASTER_URL: http://main
+      SLEEP_AFTER_REQUESTS: ${SLEEP_AFTER_REQUESTS:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    deploy:
+      replicas: ${SECONDARY_REPLICAS_COUNT:-2}
+    depends_on:
+      main:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1::80"
