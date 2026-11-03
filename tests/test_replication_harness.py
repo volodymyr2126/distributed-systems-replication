@@ -72,7 +72,7 @@ class ReplicationHarnessTests(unittest.IsolatedAsyncioTestCase):
         first, second = self.secondaries
         self.transport.set_failure(self.master, second)
 
-        with self.assertRaisesRegex(ReplicationError, "not acknowledged by all"):
+        with self.assertRaisesRegex(ReplicationError, "not acknowledged by"):
             await self.master.append_msg("m1")
 
         self.assertEqual(self.master.list_msgs(), ["m1"])

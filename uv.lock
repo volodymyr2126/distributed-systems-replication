@@ -411,9 +411,10 @@ wheels = [
 [[package]]
 name = "distributed-systems-replication"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
+    { name = "ordered-set" },
 ]
 
 [package.dev-dependencies]
@@ -422,7 +423,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "fastapi", extras = ["standard"], specifier = ">=0.142.2" }]
+requires-dist = [
+    { name = "fastapi", extras = ["standard"], specifier = ">=0.142.2" },
+    { name = "ordered-set", specifier = ">=4.1.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [{ name = "notebook", specifier = ">=7.6.3" }]
@@ -1349,6 +1353,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2e/21/910f085c0b83b80e45c341c7859baef37c877046b2c44c88d5ff2d5db948/opentelemetry_semantic_conventions-0.66b0.tar.gz", hash = "sha256:97a77dce484c54861e7eeff7651fd8a806dd3c30e501dc316730215ec36890e6", size = 150247, upload-time = "2026-09-25T12:32:44.827Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/93/2ad416d69c4ca8fd21ebc6894f23f4eda744dc6f43a14d7a9ffd7ed3abbd/opentelemetry_semantic_conventions-0.66b0-py3-none-any.whl", hash = "sha256:175b19dd98c4473f4f43a2b1df59186fd7b4a48cd3f77cbe03438b6d6fda230a", size = 206277, upload-time = "2026-09-25T12:32:26.484Z" },
+]
+
+[[package]]
+name = "ordered-set"
+version = "4.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4c/ca/bfac8bc689799bcca4157e0e0ced07e70ce125193fc2e166d2e685b7e2fe/ordered-set-4.1.0.tar.gz", hash = "sha256:694a8e44c87657c59292ede72891eb91d34131f6531463aab3009191c77364a8", size = 12826, upload-time = "2022-01-26T14:38:56.6Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/55/af02708f230eb77084a299d7b08175cff006dea4f2721074b92cdb0296c0/ordered_set-4.1.0-py3-none-any.whl", hash = "sha256:046e1132c71fcf3330438a539928932caf51ddbc582496833e23de611de14562", size = 7634, upload-time = "2022-01-26T14:38:48.677Z" },
 ]
 
 [[package]]

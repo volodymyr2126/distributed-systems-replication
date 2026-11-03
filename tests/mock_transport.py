@@ -13,6 +13,10 @@ class MockedTransport:
     def __init__(self) -> None:
         self._delays: dict[tuple[str, str], float] = {}
         self._failures: set[tuple[str, str]] = set()
+        self._reorder_counts: dict[tuple[str, str], int] = {}
+        self._reorder_buffers: dict[
+            tuple[str, str], list[tuple[Message, asyncio.Future]]
+        ] = {}
         self._started_events: dict[tuple[str, str], asyncio.Event] = {}
         self._acknowledged_events: dict[tuple[str, str], asyncio.Event] = {}
         self.master: MasterNode | None = None
@@ -47,6 +51,18 @@ class MockedTransport:
     def remove_failure(self, master: MasterNode, secondary: SecondaryNode) -> None:
         self._failures.discard(self._connection(master, secondary))
 
+    def reorder_messages(
+        self, master: MasterNode, secondary: SecondaryNode, messages_count: int = 2
+    ) -> None:
+        """Hold messages on this link until ``messages_count`` are queued,
+        then deliver the batch in reverse order."""
+        if messages_count < 2:
+            raise ValueError("messages_count must be at least 2")
+        self._reorder_counts[self._connection(master, secondary)] = messages_count
+
+    def remove_reorder(self, master: MasterNode, secondary: SecondaryNode) -> None:
+        self._reorder_counts.pop(self._connection(master, secondary), None)
+
     def started_event(
         self, master: MasterNode, secondary: SecondaryNode
     ) -> asyncio.Event:
@@ -71,6 +87,18 @@ class MockedTransport:
                 f"Simulated link failure from {master.name} to {secondary.name}"
             )
 
-        acknowledgement = secondary.receive(message)
+        count = self._reorder_counts.get(connection)
+        if count:
+            future = asyncio.get_running_loop().create_future()
+            buffer = self._reorder_buffers.setdefault(connection, [])
+            buffer.append((message, future))
+            if len(buffer) >= count:
+                batch, self._reorder_buffers[connection] = buffer[:], []
+                for queued, queued_future in reversed(batch):
+                    secondary.receive(queued)
+                    queued_future.set_result(queued)
+            acknowledgement = await future
+        else:
+            acknowledgement = secondary.receive(message)
         self.acknowledged_event(master, secondary).set()
         return acknowledgement

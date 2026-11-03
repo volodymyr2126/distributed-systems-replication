@@ -71,7 +71,8 @@ class ReplicationHttpIntegrationTests(unittest.TestCase):
         message = f"integration-{uuid4()}"
         started = time.perf_counter()
         response = self.client.post(
-            f"{self.master_url}/message", params={"message": message}
+            f"{self.master_url}/message",
+            params={"message": message, "w": len(self.secondary_urls) + 1},
         )
         elapsed = time.perf_counter() - started
 
