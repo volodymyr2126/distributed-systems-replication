@@ -5,12 +5,13 @@ import socket
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from common import Message, configure_logger
 
 logger = configure_logger(__name__)
 
 messages = []
+message_lock = asyncio.Lock()
 master_url = os.getenv("MASTER_URL", "http://localhost:8080").rstrip("/")
 secondary_url = os.getenv("SECONDARY_URL", "").rstrip("/")
 sleep_after_requests = float(os.getenv("SLEEP_AFTER_REQUESTS", "0"))
@@ -80,13 +81,27 @@ def read_messages():
     return messages
 
 @app.post("/message")
-async def receive_message(message: str):
-    message_id = len(messages) + 1
-    new_message = Message(message_id, message)
-    messages.append(new_message)
-    logger.info("Received message %s", message_id)
+async def receive_message(message: str, message_id: int = Query(..., ge=1)):
+    async with message_lock:
+        is_new_message = False
+        if message_id <= len(messages):
+            existing_message = messages[message_id - 1]
+            if existing_message.message != message:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Message ID {message_id} already has different content",
+                )
+        elif message_id == len(messages) + 1:
+            messages.append(Message(message_id, message))
+            is_new_message = True
+            logger.info("Received message %s", message_id)
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Expected message ID {len(messages) + 1}, received {message_id}",
+            )
 
-    if sleep_after_requests:
-        await asyncio.sleep(sleep_after_requests)
+        if sleep_after_requests and is_new_message:
+            await asyncio.sleep(sleep_after_requests)
 
     return {"message_id": message_id, "message": message}

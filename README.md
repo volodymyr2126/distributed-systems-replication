@@ -56,9 +56,16 @@ Stop the services with:
 docker compose down
 ```
 
-The master API provides `GET /health`, `POST /message?message=...`, and
-`GET /message`. Secondaries provide `GET /health`, `POST /message?message=...`
-for replication, and `GET /message`.
+The master API provides `GET /health`, `POST /message?message=...&w=...`, and
+`GET /message`. The required `w` parameter is the number of acknowledgements
+including the master: `w=1` waits only for the master, while `w=2` waits for
+the master and one secondary. It must be between `1` and the configured
+secondary count plus one. The master continues replicating to remaining
+secondaries after satisfying the requested concern.
+
+Secondaries provide `GET /health`, `POST /message?message=...&message_id=...`
+for replication, and `GET /message`. The master assigns message IDs, and each
+secondary accepts messages in ID order.
 
 ## Run tests
 
@@ -72,6 +79,12 @@ simulated link failures:
 ```sh
 .venv/bin/python -m unittest discover -s tests -p 'test_replication_harness.py' -v
 ```
+
+The iteration 2 harness tests (`test_iteration2_harness.py`) cover write concern
+(`append_msg(msg, w=...)`), the delayed-secondary acceptance scenario
+(temporary inconsistency, then eventual consistency), and
+`transport.reorder_messages(master, secondary, messages_count=2)`, which delivers
+batches in reverse; secondaries buffer by message ID so their log stays in order.
 
 ### HTTP integration tests (Docker services must be running)
 
