@@ -26,6 +26,7 @@ Optional settings can be changed in `.env`:
 | `APP_PORT` | `8080` | Host port for the master HTTP API |
 | `SECONDARY_REPLICAS_COUNT` | `2` | Number of secondary containers |
 | `SLEEP_AFTER_REQUESTS` | `0` | Delay in seconds before a secondary acknowledges a message |
+| `REPLICATION_TIMEOUT` | `60` | Seconds the master waits for a secondary ACK; keep above `SLEEP_AFTER_REQUESTS` |
 | `LOG_LEVEL` | `INFO` | Application log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 
 ## Start the Docker services

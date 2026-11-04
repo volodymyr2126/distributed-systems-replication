@@ -7,7 +7,9 @@ import httpx
 from common import Message, configure_logger
 
 lock = asyncio.Lock()
-client = httpx.AsyncClient(timeout=5.0)
+# Must exceed the secondaries' SLEEP_AFTER_REQUESTS, or slow replicas look failed.
+replication_timeout = float(os.getenv("REPLICATION_TIMEOUT", "60"))
+client = httpx.AsyncClient(timeout=replication_timeout)
 
 app = FastAPI()
 logger = configure_logger(__name__)
