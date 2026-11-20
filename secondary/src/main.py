@@ -11,6 +11,8 @@ from common import Message, configure_logger
 logger = configure_logger(__name__)
 
 messages = []
+# Messages received ahead of a gap; shown only once every earlier id arrived.
+buffer: dict[int, Message] = {}
 message_lock = asyncio.Lock()
 master_url = os.getenv("MASTER_URL", "http://localhost:8080").rstrip("/")
 secondary_url = os.getenv("SECONDARY_URL", "").rstrip("/")
@@ -73,35 +75,41 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 def read_root():
-    return {"status": "healthy"}
+    return {"status": "healthy", "last_id": len(messages)}
 
 
 @app.get("/message")
 def read_messages():
     return messages
 
+
 @app.post("/message")
 async def receive_message(message: str, message_id: int = Query(..., ge=1)):
     async with message_lock:
         is_new_message = False
-        if message_id <= len(messages):
-            existing_message = messages[message_id - 1]
-            if existing_message.message != message:
+        existing = (
+            messages[message_id - 1]
+            if message_id <= len(messages)
+            else buffer.get(message_id)
+        )
+        if existing is not None:
+            # Deduplication: a retried delivery is acknowledged but not stored twice.
+            if existing.message != message:
                 raise HTTPException(
                     status_code=409,
                     detail=f"Message ID {message_id} already has different content",
                 )
-        elif message_id == len(messages) + 1:
-            messages.append(Message(message_id, message))
-            is_new_message = True
-            logger.info("Received message %s", message_id)
         else:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Expected message ID {len(messages) + 1}, received {message_id}",
-            )
+            buffer[message_id] = Message(message_id, message)
+            is_new_message = True
+            # Total order: expose a message only when all earlier ones are present.
+            while len(messages) + 1 in buffer:
+                messages.append(buffer.pop(len(messages) + 1))
+            logger.info("Received message %s", message_id)
 
         if sleep_after_requests and is_new_message:
             await asyncio.sleep(sleep_after_requests)
 
-    return {"message_id": message_id, "message": message}
+        last_id = len(messages)
+
+    return {"message_id": message_id, "message": message, "last_id": last_id}

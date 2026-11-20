@@ -16,6 +16,8 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
             master.lock,
             master.client,
         )
+        self.original_retry = master.retry_initial_delay, master.retry_max_delay
+        master.retry_initial_delay = master.retry_max_delay = 0.05
         master.messages = []
         master.replicas = [master.Replica(i, f"http://replica{i}") for i in range(1, 4)]
         master.expected_replicas = len(master.replicas)
@@ -24,6 +26,7 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
         self.started = {i: asyncio.Event() for i in range(1, 4)}
         self.release = {i: asyncio.Event() for i in range(1, 4)}
         self.received = {i: [] for i in range(1, 4)}
+        self.failing = set()
         for event in self.release.values():
             event.set()
 
@@ -33,6 +36,8 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
             message = request.url.params["message"]
             self.started[replica_id].set()
             await self.release[replica_id].wait()
+            if replica_id in self.failing:
+                return httpx.Response(500, json={"detail": "boom"})
             self.received[replica_id].append(message_id)
             return httpx.Response(
                 200, json={"message_id": message_id, "message": message}
@@ -49,12 +54,12 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
         for event in self.release.values():
             event.set()
         tasks = [
-            replica.last_replication
-            for replica in master.replicas
-            if replica.last_replication is not None
+            replica.task for replica in master.replicas if replica.task is not None
         ]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        master.retry_initial_delay, master.retry_max_delay = self.original_retry
 
         await self.client.aclose()
         await master.client.aclose()
@@ -70,6 +75,13 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
         return await self.client.post(
             "/message", params={"message": message, "w": w}
         )
+
+    async def _wait_until_replicated(self, count: int) -> None:
+        async def done() -> None:
+            while any(r.acked_up_to < count for r in master.replicas):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(done(), timeout=2)
 
     async def test_w1_returns_without_waiting_for_secondary_acks(self) -> None:
         for event in self.release.values():
@@ -150,16 +162,7 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
 
         for event in self.release.values():
             event.set()
-        await asyncio.wait_for(
-            asyncio.gather(
-                *(
-                    replica.last_replication
-                    for replica in master.replicas
-                    if replica.last_replication is not None
-                )
-            ),
-            timeout=1,
-        )
+        await self._wait_until_replicated(2)
         self.assertEqual(self.received, {1: [1, 2], 2: [1, 2], 3: [1, 2]})
 
     async def test_write_concern_above_cluster_size_is_rejected(self) -> None:
@@ -168,34 +171,80 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(master.messages, [])
 
-    async def test_secondary_rejects_out_of_order_message_ids(self) -> None:
-        original_state = secondary.messages, secondary.message_lock
-        secondary.messages = []
+    async def test_failed_delivery_is_retried_and_w3_blocks_until_it_succeeds(self) -> None:
+        self.failing.add(3)
+        task = asyncio.create_task(self._post("m1", w=4))
+        await asyncio.sleep(0.3)
+        self.assertFalse(task.done(), "w=4 must block while replica 3 fails")
+
+        # Parallel clients with a lower write concern are not blocked.
+        response = await asyncio.wait_for(self._post("m2", w=3), timeout=1)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(task.done())
+
+        self.failing.clear()
+        response = await asyncio.wait_for(task, timeout=2)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["acknowledged_by"], [1, 2, 3])
+        await self._wait_until_replicated(2)
+        self.assertEqual(self.received[3], [1, 2])
+
+    async def test_no_quorum_makes_master_read_only(self) -> None:
+        self.assertEqual((await self._post("ok", w=1)).status_code, 200)
+        for replica in master.replicas[:3]:
+            replica.status = master.UNHEALTHY
+
+        response = await self._post("rejected", w=1)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("read-only", response.json()["detail"])
+        self.assertEqual([m.message for m in master.messages], ["ok"])
+        self.assertEqual((await self.client.get("/message")).status_code, 200)
+        health = (await self.client.get("/health")).json()
+        self.assertTrue(health["read_only"])
+
+    async def test_health_reports_secondary_statuses(self) -> None:
+        master.replicas[1].status = master.SUSPECTED
+        health = (await self.client.get("/health")).json()
+        self.assertFalse(health["read_only"])
+        self.assertEqual(
+            [s["status"] for s in health["secondaries"]],
+            ["healthy", "suspected", "healthy"],
+        )
+
+    async def test_writes_accepted_before_all_secondaries_registered(self) -> None:
+        master.expected_replicas = 4
+        response = await self._post("m1", w=1)
+        self.assertEqual(response.status_code, 200)
+        master.expected_replicas = 3
+
+    async def test_secondary_buffers_out_of_order_and_deduplicates(self) -> None:
+        original_state = secondary.messages, secondary.buffer, secondary.message_lock
+        secondary.messages, secondary.buffer = [], {}
         secondary.message_lock = asyncio.Lock()
         client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=secondary.app),
             base_url="http://secondary",
         )
         try:
-            out_of_order = await client.post(
-                "/message", params={"message": "m2", "message_id": 2}
-            )
-            first = await client.post(
-                "/message", params={"message": "m1", "message_id": 1}
-            )
-            second = await client.post(
-                "/message", params={"message": "m2", "message_id": 2}
-            )
+            async def send(message_id: int, message: str) -> httpx.Response:
+                return await client.post(
+                    "/message", params={"message": message, "message_id": message_id}
+                )
 
-            self.assertEqual(out_of_order.status_code, 409)
-            self.assertEqual(first.status_code, 200)
-            self.assertEqual(second.status_code, 200)
+            self.assertEqual((await send(2, "m2")).status_code, 200)
+            self.assertEqual(secondary.messages, [])  # hidden until m1 arrives
+            self.assertEqual((await send(1, "m1")).status_code, 200)
+            self.assertEqual((await send(1, "m1")).status_code, 200)  # duplicate
+            self.assertEqual((await send(2, "m2")).status_code, 200)  # duplicate
+            self.assertEqual((await send(2, "other")).status_code, 409)
             self.assertEqual(
                 [message.message_id for message in secondary.messages], [1, 2]
             )
+            self.assertEqual((await client.get("/health")).json()["last_id"], 2)
         finally:
             await client.aclose()
-            secondary.messages, secondary.message_lock = original_state
+            secondary.messages, secondary.buffer, secondary.message_lock = original_state
 
 
 if __name__ == "__main__":

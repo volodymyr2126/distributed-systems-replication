@@ -139,11 +139,18 @@ class ReplicationHttpIntegrationTests(unittest.TestCase):
     # ---- health / validation -------------------------------------------
 
     def test_health_endpoints(self) -> None:
-        for url in [self.master_url, *self.secondary_urls]:
+        for url in self.secondary_urls:
             with self.subTest(url=url):
                 response = self.client.get(f"{url}/health")
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json(), {"status": "healthy"})
+                self.assertEqual(response.json()["status"], "healthy")
+
+        response = self.client.get(f"{self.master_url}/health")
+        self.assertEqual(response.status_code, 200)
+        health = response.json()
+        self.assertFalse(health["read_only"])
+        self.assertEqual(len(health["secondaries"]), len(self.secondary_urls))
+        self.assertTrue(all(s["status"] == "healthy" for s in health["secondaries"]))
 
     def test_invalid_write_concern_is_rejected_and_nothing_is_stored(self) -> None:
         tag = f"invalid-{uuid4()}"
@@ -257,7 +264,7 @@ class ReplicationHttpIntegrationTests(unittest.TestCase):
 
     # ---- secondary guards ------------------------------------------------
 
-    def test_secondary_rejects_gaps_and_conflicting_duplicates_but_accepts_redelivery(
+    def test_secondary_rejects_conflicting_duplicates_but_accepts_redelivery(
         self,
     ) -> None:
         self.assertEqual(self._post(f"guard-{uuid4()}", w=1).status_code, 200)
@@ -265,13 +272,6 @@ class ReplicationHttpIntegrationTests(unittest.TestCase):
         secondary = self.secondary_urls[0]
         existing = self._messages(secondary)[-1]
         before = self._messages(secondary)
-
-        # Gap: ahead of the next expected id.
-        gap = self.client.post(
-            f"{secondary}/message",
-            params={"message": "gap", "message_id": existing["message_id"] + 5},
-        )
-        self.assertEqual(gap.status_code, 409)
 
         # Same id, different content.
         conflict = self.client.post(
