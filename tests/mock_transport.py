@@ -13,6 +13,7 @@ class MockedTransport:
     def __init__(self) -> None:
         self._delays: dict[tuple[str, str], float] = {}
         self._failures: set[tuple[str, str]] = set()
+        self._drops: set[tuple[str, str]] = set()
         self._reorder_counts: dict[tuple[str, str], int] = {}
         self._reorder_buffers: dict[
             tuple[str, str], list[tuple[Message, asyncio.Future]]
@@ -51,6 +52,13 @@ class MockedTransport:
     def remove_failure(self, master: MasterNode, secondary: SecondaryNode) -> None:
         self._failures.discard(self._connection(master, secondary))
 
+    def drop_message(self, master: MasterNode, secondary: SecondaryNode) -> None:
+        """Silently lose every message on this link (the sender sees a timeout)."""
+        self._drops.add(self._connection(master, secondary))
+
+    def remove_drop(self, master: MasterNode, secondary: SecondaryNode) -> None:
+        self._drops.discard(self._connection(master, secondary))
+
     def reorder_messages(
         self, master: MasterNode, secondary: SecondaryNode, messages_count: int = 2
     ) -> None:
@@ -80,6 +88,20 @@ class MockedTransport:
     ) -> Message:
         connection = self._connection(master, secondary)
         self.started_event(master, secondary).set()
+        if connection in self._drops:
+            await asyncio.Event().wait()  # lost: never answered, caller times out
+        # The message is "on the wire": it still arrives after the caller gave
+        # up waiting, which is what makes duplicates (and dedup) observable.
+        transmission = asyncio.create_task(
+            self._transmit(master, secondary, message)
+        )
+        transmission.add_done_callback(lambda t: t.cancelled() or t.exception())
+        return await asyncio.shield(transmission)
+
+    async def _transmit(
+        self, master: MasterNode, secondary: SecondaryNode, message: Message
+    ) -> Message:
+        connection = self._connection(master, secondary)
         await asyncio.sleep(self._delays.get(connection, 0))
 
         if connection in self._failures:
@@ -96,7 +118,8 @@ class MockedTransport:
                 batch, self._reorder_buffers[connection] = buffer[:], []
                 for queued, queued_future in reversed(batch):
                     secondary.receive(queued)
-                    queued_future.set_result(queued)
+                    if not queued_future.done():
+                        queued_future.set_result(queued)
             acknowledgement = await future
         else:
             acknowledgement = secondary.receive(message)

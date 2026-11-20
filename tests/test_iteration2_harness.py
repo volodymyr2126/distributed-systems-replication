@@ -3,7 +3,7 @@ import time
 import unittest
 
 from tests.mock_transport import MockedTransport
-from tests.replicated_log import MasterNode, ReplicationError, SecondaryNode
+from tests.replicated_log import MasterNode, SecondaryNode
 
 DELAY = 0.5
 
@@ -63,12 +63,16 @@ class Iteration2HarnessTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.master.append_msg("x", w=w)
 
-    async def test_w_unmet_because_of_link_failures(self) -> None:
+    async def test_w_unmet_blocks_until_links_recover(self) -> None:
         self.transport.set_failure(self.master, self.s1)
         self.transport.set_failure(self.master, self.s2)
         await self.master.append_msg("ok", w=1)
-        with self.assertRaises(ReplicationError):
-            await self.master.append_msg("bad", w=2)
+        pending = asyncio.create_task(self.master.append_msg("later", w=2))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(pending), timeout=0.3)
+
+        self.transport.remove_failure(self.master, self.s1)
+        await asyncio.wait_for(pending, timeout=2)
 
     async def test_reordered_messages_are_listed_in_order(self) -> None:
         self.transport.reorder_messages(self.master, self.s1, messages_count=2)

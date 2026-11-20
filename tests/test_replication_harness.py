@@ -68,13 +68,18 @@ class ReplicationHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.list_msgs(), expected_messages)
         self.assertEqual(second.list_msgs(), expected_messages)
 
-    async def test_transport_can_simulate_a_link_failure(self) -> None:
+    async def test_link_failure_blocks_the_write_until_the_link_heals(self) -> None:
         first, second = self.secondaries
         self.transport.set_failure(self.master, second)
 
-        with self.assertRaisesRegex(ReplicationError, "not acknowledged by"):
-            await self.master.append_msg("m1")
+        append_task = asyncio.create_task(self.master.append_msg("m1"))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(append_task), timeout=0.3)
 
         self.assertEqual(self.master.list_msgs(), ["m1"])
         self.assertEqual(first.list_msgs(), ["m1"])
         self.assertEqual(second.list_msgs(), [])
+
+        self.transport.remove_failure(self.master, second)
+        await asyncio.wait_for(append_task, timeout=2)
+        self.assertEqual(second.list_msgs(), ["m1"])
