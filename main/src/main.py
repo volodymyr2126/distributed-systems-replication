@@ -29,9 +29,11 @@ UNHEALTHY = "unhealthy"
 
 class Replica:
 
-    def __init__(self, replica_id: int, url: str):
+    def __init__(self, replica_id: int, url: str, node_id: str | None = None):
         self.replica_id = replica_id
         self.url = url
+        # Identity of the secondary that survives a change of its URL.
+        self.node_id = node_id
         # Messages 1..acked_up_to are acknowledged by this secondary. The
         # sender delivers strictly in id order, one message at a time.
         self.acked_up_to = 0
@@ -62,7 +64,9 @@ def notify_acks() -> None:
 
 def backoff_delay(attempt: int) -> float:
     """Exponential back-off with jitter, capped at ``retry_max_delay``."""
-    delay = min(retry_max_delay, retry_initial_delay * (2 ** attempt))
+    # Attempts are unlimited, so bound the exponent: a huge power of two cannot
+    # be converted to float and would crash the sender.
+    delay = min(retry_max_delay, retry_initial_delay * (2 ** min(attempt, 30)))
     return delay / 2 + random.uniform(0, delay / 2)
 
 
@@ -144,14 +148,27 @@ def ensure_sender(replica: Replica) -> None:
     replica.wake.set()
 
 
+def stop_sender(replica: Replica) -> None:
+    """Cancel the sender together with its in-flight delivery attempt."""
+    if replica.task is not None:
+        replica.task.cancel()
+        replica.task = None
+
+
 async def check_replica(replica: Replica) -> None:
+    url = replica.url
+    reachable = True
     try:
-        response = await client.get(
-            f"{replica.url}/health", timeout=heartbeat_timeout
-        )
+        response = await client.get(f"{url}/health", timeout=heartbeat_timeout)
         response.raise_for_status()
         body = response.json()
     except (httpx.HTTPError, ValueError):
+        reachable = False
+
+    if replica not in replicas or replica.url != url:
+        return  # removed or moved while the heartbeat was in flight
+
+    if not reachable:
         replica.missed_heartbeats += 1
         replica.status = (
             UNHEALTHY
@@ -218,25 +235,54 @@ def health_check():
 
 
 @app.post("/replica")
-async def register_replica(replica_url: AnyHttpUrl):
+async def register_replica(replica_url: AnyHttpUrl, node_id: str | None = None):
     normalized_url = str(replica_url).rstrip("/")
 
     async with lock:
-        for replica in replicas:
-            if replica.url == normalized_url:
-                # A rejoining secondary may have lost its in-memory log.
-                replica.acked_up_to = 0
-                replica.status = HEALTHY
-                replica.missed_heartbeats = 0
-                ensure_sender(replica)
-                replica.retry_now.set()
-                return {"replica_id": replica.replica_id, "registered": True}
-        replica_id = len(replicas) + 1
-        replica = Replica(replica_id, normalized_url)
-        replicas.append(replica)
+        # A secondary is recognised by its node id even if its URL changed, so
+        # one node is never counted twice. Without an id the URL identifies it.
+        replica = next(
+            (r for r in replicas if node_id and r.node_id == node_id), None
+        )
+        if replica is None:
+            replica = next(
+                (
+                    r
+                    for r in replicas
+                    if r.url == normalized_url
+                    and (node_id is None or r.node_id is None)
+                ),
+                None,
+            )
+
+        # Any other entry with this URL is stale: the address has a new owner.
+        for stale in [r for r in replicas if r.url == normalized_url]:
+            if stale is not replica:
+                stop_sender(stale)
+                replicas.remove(stale)
+                logger.info(
+                    "Removed replica %s: %s now belongs to another node",
+                    stale.replica_id, normalized_url,
+                )
+
+        if replica is None:
+            replica_id = max((r.replica_id for r in replicas), default=0) + 1
+            replica = Replica(replica_id, normalized_url, node_id)
+            replicas.append(replica)
+        else:
+            # A rejoining secondary may have lost its in-memory log. Restarting
+            # the sender keeps a late answer to an old attempt from counting.
+            stop_sender(replica)
+            replica.url = normalized_url
+            replica.node_id = node_id or replica.node_id
+            replica.acked_up_to = 0
+            replica.status = HEALTHY
+            replica.missed_heartbeats = 0
         ensure_sender(replica)
-        logger.info("Registered replica %s at %s", replica_id, normalized_url)
-        return {"replica_id": replica_id, "registered": True}
+        logger.info(
+            "Registered replica %s at %s", replica.replica_id, normalized_url
+        )
+        return {"replica_id": replica.replica_id, "registered": True}
 
 
 @app.get("/message")

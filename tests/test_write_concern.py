@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 import unittest
 
 import httpx
@@ -217,6 +218,87 @@ class WriteConcernHttpTests(unittest.IsolatedAsyncioTestCase):
         response = await self._post("m1", w=1)
         self.assertEqual(response.status_code, 200)
         master.expected_replicas = 3
+
+    async def test_retry_delay_stays_bounded_after_unlimited_attempts(self) -> None:
+        for attempt in (0, 31, 1024, 1_000_000):
+            with self.subTest(attempt=attempt):
+                delay = master.backoff_delay(attempt)
+                self.assertLessEqual(delay, master.retry_max_delay)
+                self.assertGreaterEqual(delay, 0)
+
+    async def _register(self, url: str, node_id: str) -> int:
+        response = await self.client.post(
+            "/replica", params={"replica_url": url, "node_id": node_id}
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["replica_id"]
+
+    async def test_secondary_with_new_url_is_not_counted_twice(self) -> None:
+        master.replicas = []
+        master.expected_replicas = 2
+        first_id = await self._register("http://replica1", "node-a")
+        task = asyncio.create_task(self._post("m1", w=3))
+        await self._wait_until_replicated(1)
+
+        # The same node comes back under another address and gets m1 again.
+        self.failing.add(1)
+        self.assertEqual(await self._register("http://replica3", "node-a"), first_id)
+        await self._wait_until_replicated(1)
+        await asyncio.sleep(0.1)
+        self.assertEqual([r.url for r in master.replicas], ["http://replica3"])
+        self.assertFalse(task.done(), "one node must count as one acknowledgement")
+
+        await self._register("http://replica2", "node-b")
+        response = await asyncio.wait_for(task, timeout=2)
+        self.assertEqual(len(response.json()["acknowledged_by"]), 2)
+        self.assertTrue(response.json()["replication_complete"])
+
+    async def test_url_taken_over_by_another_node_replaces_the_stale_entry(
+        self,
+    ) -> None:
+        master.replicas = []
+        master.expected_replicas = 2
+        await self._register("http://replica1", "node-a")
+        stale_sender = master.replicas[0].task
+
+        await self._register("http://replica1", "node-b")
+
+        self.assertEqual([r.node_id for r in master.replicas], ["node-b"])
+        await asyncio.gather(stale_sender, return_exceptions=True)
+        self.assertTrue(stale_sender.cancelled())
+
+    async def test_late_answer_from_before_reregistration_is_ignored(self) -> None:
+        master.replicas = []
+        master.expected_replicas = 1
+        self.release[1].clear()  # the old instance does not answer yet
+        await self._register("http://replica1", "node-a")
+        await self._post("m1", w=1)
+        await asyncio.wait_for(self.started[1].wait(), timeout=1)
+
+        self.release[2].clear()
+        await self._register("http://replica2", "node-a")
+        self.release[1].set()
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(master.replicas[0].acked_up_to, 0)
+
+    async def test_secondary_node_id_is_generated_once_and_reused(self) -> None:
+        original = secondary.configured_node_id, secondary.node_id_file
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                secondary.configured_node_id = ""
+                secondary.node_id_file = ""
+                self.assertIsNone(secondary.get_node_id())
+
+                secondary.node_id_file = f"{directory}/node/id"
+                generated = secondary.get_node_id()
+                self.assertTrue(generated)
+                self.assertEqual(secondary.get_node_id(), generated)
+
+                secondary.configured_node_id = "explicit"
+                self.assertEqual(secondary.get_node_id(), "explicit")
+        finally:
+            secondary.configured_node_id, secondary.node_id_file = original
 
     async def test_secondary_buffers_out_of_order_and_deduplicates(self) -> None:
         original_state = secondary.messages, secondary.buffer, secondary.message_lock

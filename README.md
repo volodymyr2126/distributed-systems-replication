@@ -34,6 +34,14 @@ Optional settings can be changed in `.env`:
 | `HEARTBEAT_UNHEALTHY_AFTER` | `3` | Consecutive missed heartbeats after which a secondary is `unhealthy` (1+ missed = `suspected`) |
 | `LOG_LEVEL` | `INFO` | Application log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 
+Each secondary registers with a node ID, so the master still recognises it after
+its address changes and never counts it twice. Docker Compose sets
+`NODE_ID_FILE`: the ID is generated once and kept in a per-replica anonymous
+volume, which survives restarts and recreation by `docker compose up`. A
+secondary removed with `docker compose rm` or `down` gets a new ID; use
+`docker compose down -v` to also delete the volumes. Outside Compose, set a unique `NODE_ID` (or `NODE_ID_FILE`) per secondary; with neither,
+the master identifies it by URL.
+
 ## Start the Docker services
 
 Build and start one master and the configured number of secondaries:

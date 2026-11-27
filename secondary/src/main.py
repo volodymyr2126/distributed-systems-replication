@@ -1,8 +1,10 @@
 import asyncio
 from contextlib import asynccontextmanager
 import os
+from pathlib import Path
 import socket
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -16,6 +18,10 @@ buffer: dict[int, Message] = {}
 message_lock = asyncio.Lock()
 master_url = os.getenv("MASTER_URL", "http://localhost:8080").rstrip("/")
 secondary_url = os.getenv("SECONDARY_URL", "").rstrip("/")
+# Identity reported to the master: NODE_ID (unique per secondary), or an id
+# generated once and kept in NODE_ID_FILE.
+configured_node_id = os.getenv("NODE_ID", "")
+node_id_file = os.getenv("NODE_ID_FILE", "")
 sleep_after_requests = float(os.getenv("SLEEP_AFTER_REQUESTS", "0"))
 if sleep_after_requests < 0:
     raise ValueError("SLEEP_AFTER_REQUESTS must be non-negative")
@@ -40,13 +46,34 @@ def get_secondary_url() -> str:
     return f"http://{secondary_ip}:80"
 
 
+def get_node_id() -> str | None:
+    """Returns None when no identity is configured (the master then uses the URL)."""
+    if configured_node_id:
+        return configured_node_id
+    if not node_id_file:
+        return None
+
+    path = Path(node_id_file)
+    if path.exists():
+        stored = path.read_text().strip()
+        if stored:
+            return stored
+    generated = uuid4().hex
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(generated)
+    return generated
+
+
 async def register_with_master() -> None:
     async with httpx.AsyncClient(timeout=5.0) as client:
         while True:
             try:
+                params = {"replica_url": get_secondary_url()}
+                node_id = get_node_id()
+                if node_id:
+                    params["node_id"] = node_id
                 response = await client.post(
-                    f"{master_url}/replica",
-                    params={"replica_url": get_secondary_url()},
+                    f"{master_url}/replica", params=params
                 )
                 response.raise_for_status()
                 registration = response.json()
