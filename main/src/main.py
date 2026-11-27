@@ -1,89 +1,294 @@
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AnyHttpUrl
+from contextlib import asynccontextmanager
 from typing import List
 import os
+import random
 import asyncio
 import httpx
 from common import Message, configure_logger
 
 lock = asyncio.Lock()
-# Must exceed the secondaries' SLEEP_AFTER_REQUESTS, or slow replicas look failed.
+# Per-request timeout for one delivery attempt; a slow/unresponsive secondary
+# makes the attempt fail and the delivery is retried.
 replication_timeout = float(os.getenv("REPLICATION_TIMEOUT", "60"))
+retry_initial_delay = float(os.getenv("RETRY_INITIAL_DELAY", "0.5"))
+retry_max_delay = float(os.getenv("RETRY_MAX_DELAY", "10"))
+heartbeat_interval = float(os.getenv("HEARTBEAT_INTERVAL", "2"))
+heartbeat_timeout = float(os.getenv("HEARTBEAT_TIMEOUT", "2"))
+# Missed heartbeats: >=1 -> suspected, >= this value -> unhealthy.
+heartbeat_unhealthy_after = int(os.getenv("HEARTBEAT_UNHEALTHY_AFTER", "3"))
 client = httpx.AsyncClient(timeout=replication_timeout)
 
-app = FastAPI()
 logger = configure_logger(__name__)
 
+HEALTHY = "healthy"
+SUSPECTED = "suspected"
+UNHEALTHY = "unhealthy"
+
+
 class Replica:
-    
-    def __init__(self, replica_id: int, url: str):
+
+    def __init__(self, replica_id: int, url: str, node_id: str | None = None):
         self.replica_id = replica_id
         self.url = url
-        self.last_replication: asyncio.Task[tuple[int, str | None]] | None = None
-    
+        # Identity of the secondary that survives a change of its URL.
+        self.node_id = node_id
+        # Messages 1..acked_up_to are acknowledged by this secondary. The
+        # sender delivers strictly in id order, one message at a time.
+        self.acked_up_to = 0
+        self.status = HEALTHY
+        self.missed_heartbeats = 0
+        self.wake = asyncio.Event()  # new message to send
+        self.retry_now = asyncio.Event()  # cut the retry back-off short
+        self.task: asyncio.Task | None = None
+
     def __repr__(self):
         return f"Replica(id={self.replica_id}, url={self.url})"
+
 
 messages: List[Message] = []
 replicas: List[Replica] = []
 expected_replicas = int(os.getenv("SECONDARY_REPLICAS_COUNT", 2))
+# Futures of POST /message handlers waiting for more acknowledgements.
+ack_waiters: set[asyncio.Future] = set()
+heartbeat_task: asyncio.Task | None = None
 
 
-async def replicate_message(
-    replica: Replica, message_id: int, message: str
-) -> tuple[int, str | None]:
+def notify_acks() -> None:
+    for waiter in list(ack_waiters):
+        if not waiter.done():
+            waiter.set_result(None)
+    ack_waiters.clear()
+
+
+def backoff_delay(attempt: int) -> float:
+    """Exponential back-off with jitter, capped at ``retry_max_delay``."""
+    # Attempts are unlimited, so bound the exponent: a huge power of two cannot
+    # be converted to float and would crash the sender.
+    delay = min(retry_max_delay, retry_initial_delay * (2 ** min(attempt, 30)))
+    return delay / 2 + random.uniform(0, delay / 2)
+
+
+def quorum_size() -> int:
+    return (expected_replicas + 1) // 2 + 1
+
+
+def alive_nodes() -> int:
+    """Master plus every registered secondary that is not unhealthy."""
+    return 1 + sum(1 for replica in replicas if replica.status != UNHEALTHY)
+
+
+def has_quorum() -> bool:
+    return alive_nodes() >= quorum_size()
+
+
+async def replicate_message(replica: Replica, message: Message) -> bool:
+    """One delivery attempt. Returns True when the secondary acknowledged."""
     try:
         response = await client.post(
             f"{replica.url}/message",
-            params={"message": message, "message_id": message_id},
+            params={"message": message.message, "message_id": message.message_id},
         )
         response.raise_for_status()
         acknowledgement = response.json()
         if (
             not isinstance(acknowledgement, dict)
-            or acknowledgement.get("message_id") != message_id
+            or acknowledgement.get("message_id") != message.message_id
         ):
             raise ValueError(
                 f"Replica {replica.replica_id} acknowledged the wrong message"
             )
-        return replica.replica_id, None
     except (httpx.HTTPError, ValueError) as error:
-        logger.exception("Error replicating message to %s", replica.url)
-        return replica.replica_id, str(error)
+        logger.warning(
+            "Delivery of message %s to %s failed: %r",
+            message.message_id, replica.url, error,
+        )
+        return False
+
+    last_id = acknowledgement.get("last_id")
+    if isinstance(last_id, int) and last_id < message.message_id:
+        # The secondary has a gap (e.g. it restarted and lost its log):
+        # resume from what it really holds instead of counting this ack.
+        replica.acked_up_to = min(replica.acked_up_to, last_id)
+        return True
+    replica.acked_up_to = max(replica.acked_up_to, message.message_id)
+    notify_acks()
+    return True
 
 
-async def replicate_in_order(
-    replica: Replica,
-    previous_replication: asyncio.Task[tuple[int, str | None]] | None,
-    message_id: int,
-    message: str,
-) -> tuple[int, str | None]:
-    if previous_replication is not None:
-        await previous_replication
-    return await replicate_message(replica, message_id, message)
+async def replica_sender(replica: Replica) -> None:
+    """Delivers the log to one secondary in order, retrying forever."""
+    attempt = 0
+    while True:
+        if replica.acked_up_to >= len(messages):
+            replica.wake.clear()
+            if replica.acked_up_to >= len(messages):
+                await replica.wake.wait()
+            continue
+
+        message = messages[replica.acked_up_to]
+        if await replicate_message(replica, message):
+            attempt = 0
+            continue
+
+        replica.retry_now.clear()
+        try:
+            await asyncio.wait_for(
+                replica.retry_now.wait(), timeout=backoff_delay(attempt)
+            )
+        except asyncio.TimeoutError:
+            pass
+        attempt += 1
+
+
+def ensure_sender(replica: Replica) -> None:
+    if replica.task is None or replica.task.done():
+        replica.task = asyncio.create_task(replica_sender(replica))
+    replica.wake.set()
+
+
+def stop_sender(replica: Replica) -> None:
+    """Cancel the sender together with its in-flight delivery attempt."""
+    if replica.task is not None:
+        replica.task.cancel()
+        replica.task = None
+
+
+async def check_replica(replica: Replica) -> None:
+    url = replica.url
+    reachable = True
+    try:
+        response = await client.get(f"{url}/health", timeout=heartbeat_timeout)
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        reachable = False
+
+    if replica not in replicas or replica.url != url:
+        return  # removed or moved while the heartbeat was in flight
+
+    if not reachable:
+        replica.missed_heartbeats += 1
+        replica.status = (
+            UNHEALTHY
+            if replica.missed_heartbeats >= heartbeat_unhealthy_after
+            else SUSPECTED
+        )
+        return
+
+    recovered = replica.status != HEALTHY
+    replica.missed_heartbeats = 0
+    replica.status = HEALTHY
+    last_id = body.get("last_id") if isinstance(body, dict) else None
+    if isinstance(last_id, int) and last_id < replica.acked_up_to:
+        logger.warning(
+            "Replica %s lost messages (has %s, acked %s); resending",
+            replica.replica_id, last_id, replica.acked_up_to,
+        )
+        replica.acked_up_to = last_id
+        recovered = True
+    if recovered:
+        ensure_sender(replica)
+        replica.retry_now.set()
+
+
+async def heartbeat_loop() -> None:
+    while True:
+        await asyncio.gather(*(check_replica(r) for r in list(replicas)))
+        await asyncio.sleep(heartbeat_interval)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global heartbeat_task
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
+    yield
+    heartbeat_task.cancel()
+    for replica in replicas:
+        if replica.task is not None:
+            replica.task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    read_only = not has_quorum()
+    return {
+        "status": "read-only" if read_only else "healthy",
+        "read_only": read_only,
+        "quorum": quorum_size(),
+        "alive_nodes": alive_nodes(),
+        "cluster_size": expected_replicas + 1,
+        "secondaries": [
+            {
+                "replica_id": replica.replica_id,
+                "url": replica.url,
+                "status": replica.status,
+                "acked_up_to": replica.acked_up_to,
+            }
+            for replica in replicas
+        ],
+    }
+
 
 @app.post("/replica")
-async def register_replica(replica_url: AnyHttpUrl):
+async def register_replica(replica_url: AnyHttpUrl, node_id: str | None = None):
     normalized_url = str(replica_url).rstrip("/")
 
     async with lock:
-        for replica in replicas:
-            if replica.url == normalized_url:
-                return {"replica_id": replica.replica_id, "registered": True}
-        replica_id = len(replicas) + 1
-        replicas.append(Replica(replica_id, normalized_url))
-        logger.info("Registered replica %s at %s", replica_id, normalized_url)
-        return {"replica_id": replica_id, "registered": True}
+        # A secondary is recognised by its node id even if its URL changed, so
+        # one node is never counted twice. Without an id the URL identifies it.
+        replica = next(
+            (r for r in replicas if node_id and r.node_id == node_id), None
+        )
+        if replica is None:
+            replica = next(
+                (
+                    r
+                    for r in replicas
+                    if r.url == normalized_url
+                    and (node_id is None or r.node_id is None)
+                ),
+                None,
+            )
+
+        # Any other entry with this URL is stale: the address has a new owner.
+        for stale in [r for r in replicas if r.url == normalized_url]:
+            if stale is not replica:
+                stop_sender(stale)
+                replicas.remove(stale)
+                logger.info(
+                    "Removed replica %s: %s now belongs to another node",
+                    stale.replica_id, normalized_url,
+                )
+
+        if replica is None:
+            replica_id = max((r.replica_id for r in replicas), default=0) + 1
+            replica = Replica(replica_id, normalized_url, node_id)
+            replicas.append(replica)
+        else:
+            # A rejoining secondary may have lost its in-memory log. Restarting
+            # the sender keeps a late answer to an old attempt from counting.
+            stop_sender(replica)
+            replica.url = normalized_url
+            replica.node_id = node_id or replica.node_id
+            replica.acked_up_to = 0
+            replica.status = HEALTHY
+            replica.missed_heartbeats = 0
+        ensure_sender(replica)
+        logger.info(
+            "Registered replica %s at %s", replica.replica_id, normalized_url
+        )
+        return {"replica_id": replica.replica_id, "registered": True}
 
 
 @app.get("/message")
 def read_messages():
     return messages
+
 
 @app.post("/message")
 async def post_message(message: str, w: int = Query(..., ge=1)):
@@ -93,59 +298,40 @@ async def post_message(message: str, w: int = Query(..., ge=1)):
             detail=f"w must be between 1 and {expected_replicas + 1}",
         )
 
+    # Only id assignment and scheduling happen under the lock; waiting for
+    # acknowledgements does not, so a blocked client never blocks the others.
     async with lock:
-        if len(replicas) != expected_replicas:
+        if not has_quorum():
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    f"Waiting for replicas: registered {len(replicas)} of "
-                    f"{expected_replicas}"
+                    "No quorum: master is in read-only mode "
+                    f"({alive_nodes()} of {expected_replicas + 1} nodes alive, "
+                    f"{quorum_size()} required)"
                 ),
             )
 
         message_id = len(messages) + 1
         messages.append(Message(message_id, message))
-
-        replication_tasks = []
         for replica in replicas:
-            task = asyncio.create_task(
-                replicate_in_order(
-                    replica,
-                    replica.last_replication,
-                    message_id,
-                    message,
-                )
-            )
-            replica.last_replication = task
-            replication_tasks.append(task)
+            ensure_sender(replica)
 
-    acknowledged = []
-    failures = {}
-    pending = set(replication_tasks)
     secondary_acks_required = w - 1
-
-    while len(acknowledged) < secondary_acks_required and pending:
-        completed, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in completed:
-            replica_id, error = task.result()
-            if error is None:
-                acknowledged.append(replica_id)
-            else:
-                failures[replica_id] = error
-
-    if len(acknowledged) < secondary_acks_required:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message_id": message_id,
-                "write_concern": w,
-                "acknowledged_count": 1 + len(acknowledged),
-                "acknowledged_by": sorted(acknowledged),
-                "failed": failures,
-            },
-        )
+    loop = asyncio.get_running_loop()
+    while True:
+        acknowledged = [
+            replica.replica_id
+            for replica in replicas
+            if replica.acked_up_to >= message_id
+        ]
+        if len(acknowledged) >= secondary_acks_required:
+            break
+        waiter = loop.create_future()
+        ack_waiters.add(waiter)
+        try:
+            await waiter
+        finally:
+            ack_waiters.discard(waiter)
 
     return {
         "message_id": message_id,
@@ -154,8 +340,8 @@ async def post_message(message: str, w: int = Query(..., ge=1)):
         "write_concern_met": True,
         "acknowledged_count": 1 + len(acknowledged),
         "replication_complete": (
-            len(acknowledged) == len(replicas) and not failures
+            len(acknowledged) == len(replicas) == expected_replicas
         ),
         "acknowledged_by": sorted(acknowledged),
-        "failed": failures,
+        "failed": {},
     }

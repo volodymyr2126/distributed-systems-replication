@@ -8,6 +8,11 @@ services:
     environment:
       SECONDARY_REPLICAS_COUNT: ${SECONDARY_REPLICAS_COUNT:-2}
       REPLICATION_TIMEOUT: ${REPLICATION_TIMEOUT:-60}
+      RETRY_INITIAL_DELAY: ${RETRY_INITIAL_DELAY:-0.5}
+      RETRY_MAX_DELAY: ${RETRY_MAX_DELAY:-10}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-2}
+      HEARTBEAT_TIMEOUT: ${HEARTBEAT_TIMEOUT:-2}
+      HEARTBEAT_UNHEALTHY_AFTER: ${HEARTBEAT_UNHEALTHY_AFTER:-3}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/health"]
@@ -20,8 +25,12 @@ services:
       dockerfile: secondary/Dockerfile
     environment:
       MASTER_URL: http://main
+      NODE_ID_FILE: /app/node/id
       SLEEP_AFTER_REQUESTS: ${SLEEP_AFTER_REQUESTS:-0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Anonymous volume per replica: keeps the node id when it is recreated.
+      - /app/node
     deploy:
       replicas: ${SECONDARY_REPLICAS_COUNT:-2}
     depends_on:
